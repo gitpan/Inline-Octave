@@ -1,6 +1,6 @@
 #!perl -w
 # Makefile.pl for Inline::Octave
-# $Id: Makefile.PL,v 1.7 2003/11/30 14:33:02 aadler Exp $
+# $Id: Makefile.PL,v 1.9 2005/03/07 22:33:58 aadler Exp $
 
 use strict;
 use ExtUtils::MakeMaker;
@@ -22,7 +22,7 @@ foreach (@ARGV) {
 }   
 
 while (not $octave_validated) {
-   $octave_validated= 1 if `$octave -v` =~ /Octave, version ([2-9]\.\d+\.\d+)/;
+   $octave_validated= 1 if `$octave -v` =~ /Octave, version ([2-9]\.\d+\.(\d+|cvs))/;
    my $octave_version= $1;
 
    if ($octave_validated) {
@@ -62,6 +62,8 @@ while (not $octave_validated) {
 WriteMakefile(
     'NAME'         => 'Inline::Octave',
     'VERSION_FROM' => 'Octave.pm',
-    'PREREQ_PM'    => { Inline => 0.43 },
+    'PREREQ_PM'    => { 'Inline'   => 0.43,
+#                       'IPC::Run' => 0.78
+                      },
     'clean'        => {FILES => '_Inline/'},  
 );

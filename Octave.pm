@@ -2,7 +2,7 @@
 #
 # Inline::Octave - 
 #
-# $Id: Octave.pm,v 1.25 2004/04/12 17:11:17 aadler Exp $
+# $Id: Octave.pm,v 1.29 2005/03/07 21:45:15 aadler Exp $
 
 package Inline::Octave;
 
@@ -10,8 +10,6 @@ $VERSION = '0.21';
 require Inline;
 @ISA = qw(Inline);
 use Carp;
-use IO::File;
-use IPC::Open3;
 use IO::Select;
 use POSIX 'WNOHANG';
 use vars qw( $octave_object );
@@ -230,6 +228,8 @@ sub start_interpreter
    # check if interpreter already alive
    return if $octave_object->{OCTIN} and $octave_object->{OCTOUT};
 
+   use IPC::Open3;
+   use IO::File;
    my $Oin = new IO::File;
    my $Oout= new IO::File;
    my $Oerr= new IO::File;
@@ -244,6 +244,15 @@ sub start_interpreter
    croak "Can't locate octave interpreter: $@\n" if $@ =~ /Open3/i;
 
    my $select= IO::Select->new($Oout, $Oerr);
+
+# New idea - start octave with 
+# use IPC::Run qw(start);
+#  my ($Oin, $Oout, $Oerr);
+#  my $pid;
+#  eval {
+#    $pid= start $octave_object->{INTERP}, \$Oin, \$Oout, \$Oerr
+#  };
+#  croak "Error starting octave interpreter: $@\n" if $@;
 
    $octave_object->{octave_pid} = $pid;
    $octave_object->{OCTIN} = $Oin;
@@ -325,6 +334,7 @@ sub interpret
    my $Oin=    $octave_object->{OCTIN};
    my $Oerr=   $octave_object->{OCTERR};
    my $select= $octave_object->{SELECT};
+   my $pid   = $octave_object->{octave_pid};
 
    croak "octave interpreter not alive"  unless $Oin and $Oerr;
 
@@ -334,9 +344,11 @@ sub interpret
    local $SIG{PIPE}= \&reap_interpreter;
 
 #  print STDERR "INTERP: $cmd\n";
+#  $Oin = "\n\n$cmd\ndisp('$marker');fflush(stdout);\n";
+#  $pid->pump() while length $Oin;
    print $Oin "\n\n$cmd\ndisp('$marker');fflush(stdout);\n";
 
-   my $input;
+   my $input= '';
    my $marker_len= length( $marker )+1;
    while ( 1 ) {
       for my $fh ( $select->can_read() ) {
@@ -349,7 +361,13 @@ sub interpret
               select undef, undef, undef, 0.5 unless $line;
           }
       }
-      last if substr( $input, -$marker_len, -1) eq $marker;
+      last if $input && substr( $input, -$marker_len, -1) eq $marker;
+
+#     $pid->pump();
+
+      process_errors() if $Oerr;
+#     select undef, undef, undef, 0.5 unless $line;
+#     last if substr( $Oout, -$marker_len, -1) eq $marker;
    }   
 
    # we need to leave octave blocked doing something,
@@ -430,11 +448,21 @@ sub run_math_code
 sub get_defined_functions
 {
    my $o = shift;
-   my $data= $o->interpret("whos('-functions')");
+   my $data= $o->interpret("who('-functions')");
    my @funclist;
-   while ( $data =~ /user(-defined|) function +- +- +(\w+)/g )
+   $compiled_fns_marker= 0;
+   while ( $data =~ /(.+)/g )
    {
-      push @funclist, $2;
+      my $line = $1;
+      if(       $line =~ /^\*\*\* .* compiled functions/ ) {
+         $compiled_fns_marker = 1;
+      } elsif ( $line =~ /^\*\*\* / ) {
+         $compiled_fns_marker = 0 ;
+      } elsif ( $line =~ /^[\w\s]+$/ && $compiled_fns_marker ) {
+         while( $line =~ /(\w+)/g ) { 
+             push @funclist, $1;
+         }
+      }
    }
    return @funclist;
 
@@ -1092,6 +1120,18 @@ TODO LIST:
        - done
 
 $Log: Octave.pm,v $
+Revision 1.29  2005/03/07 21:45:15  aadler
+fixes for versions
+
+Revision 1.28  2005/03/07 20:20:45  aadler
+version accepts \d.\d\.cvs
+
+Revision 1.27  2004/10/11 13:15:48  aadler
+warning in $input testing
+
+Revision 1.26  2004/04/15 22:06:27  aadler
+*** empty log message ***
+
 Revision 1.25  2004/04/12 17:11:17  aadler
 added wnohang signalling
 
@@ -1448,7 +1488,7 @@ instead of methods
 
 for example:
 
-   $c= Inline::Octave::Matrix::rand(2,3);
+   $c= Inline::Octave::rand(2,3);
    print $c->disp();
 
 gives:
@@ -1496,12 +1536,9 @@ If you would like to do the octave equivalent of
 
 Then these methods will make life more convenient.
 
-   $a = Inline::Octave::Matrix::zeros(4);
-
+   $a = Inline::Octave::zeros(4);
    $a->replace_rows( [1,3], [ [1,2,3,4],[5,6,7,8] ] );
-
    $a->replace_cols( [2,4], [ [2,4],[2,4],[2,4],[2,4] ] );
-
    $a->replace_matrix( [1,4], [1,4], [ [8,7],[6,5] ] );
 
 =head1 Using Inline::Octave::ComplexMatrix
