@@ -2,19 +2,23 @@
 #
 # Inline::Octave - 
 #
-# $Id: Octave.pm,v 1.17 2003/01/07 02:47:49 aadler Exp $
+# $Id: Octave.pm,v 1.23 2003/12/04 19:22:27 aadler Exp $
 
 package Inline::Octave;
 
-$VERSION = '0.17';
+$VERSION = '0.20';
 require Inline;
 @ISA = qw(Inline);
 use Carp;
-use IPC::Open2;
+use IO::File;
+use IPC::Open3;
+use IO::Select;
 use vars qw( $octave_object );
 
 # set values which should change to this,
 # if it doesn't change, we have an error.
+# This value is not special, it's a random value thats
+# unlikely to be really used
 my $retcode_string= "[-101101.101101,-918273.6455,-178.9245867]";
 my $retcode_value=   eval $retcode_string;
 
@@ -142,7 +146,9 @@ sub _validate
   }
 
 
-  $octave_object->{MARKER} = "-9Ahv87uhBa8l_8Onq,zU9-"
+# choose a random value that's unlikely to appear normally
+# This is 50 characters long: 8^50 = 1.43e45 
+  $octave_object->{MARKER} = '-9w#wastaal!|j"Ahv8~;/+ua;78<<hs+[uhBa8l_8Onq,zU9-'
      unless exists $octave_object->{MARKER};
 }   
 
@@ -180,7 +186,7 @@ sub $perl_funname {
    my \$inargs=" ";
    my \@vin;
    for (my \$i=0; \$i < \@_; \$i++) {
-      \$vin[\$i]= new Inline::Octave::Matrix( \$_[\$i] );
+      \$vin[\$i]= Inline::Octave->new( \$_[\$i] );
       \$inargs.= \$vin[\$i]->name.",";
    }
    chop(\$inargs); #remove last ,
@@ -189,7 +195,7 @@ sub $perl_funname {
    my \$outargs=" ";
    my \@vout;
    for (my \$i=0; \$i < $nargout; \$i++) {
-      \$vout[\$i]= new Inline::Octave::Matrix( $retcode_string );
+      \$vout[\$i]= Inline::Octave->new( $retcode_string );
       \$outargs.= \$vout[\$i]->name.",";
    }
    chop(\$outargs); #remove last ,
@@ -223,23 +229,29 @@ sub start_interpreter
    # check if interpreter already alive
    return if $octave_object->{OCTIN} and $octave_object->{OCTOUT};
 
-   my $Oout; my $Oin;
+   my $Oin = new IO::File;
+   my $Oout= new IO::File;
+   my $Oerr= new IO::File;
    my $pid;
    eval {
-# This works in perl 5.6
-#     open2( $Oout, $Oin , $octave_object->{INTERP} ); 
-# But we need to do this in 5.005     
-      $pid= open2( \*OOUT, \*OIN , $octave_object->{INTERP} );
-      $Oout= \*OOUT; $Oin= \*OIN;
+      $pid= open3( $Oin , $Oout, $Oerr, $octave_object->{INTERP} );
+      # set our priority lower than the kid, so that we don't read each
+      # character. Experimentally, I've found 3 to be optimum on Linux 2.4.21
+      setpriority 0,0, (getpriority 0,0)+3;
    };
-   croak "Can't locate octave interpreter: $@\n" if $@ =~ /Open2/i;
+   # ignore errors from setpriority if it's not available
+   croak "Can't locate octave interpreter: $@\n" if $@ =~ /Open3/i;
 
-#  $SIG{CHLD}= \&reap_interpreter;
-#  $SIG{PIPE}= \&reap_interpreter;
+   $SIG{CHLD}= \&reap_interpreter;
+   $SIG{PIPE}= \&reap_interpreter;
+
+   my $select= IO::Select->new($Oout, $Oerr);
 
    $octave_object->{octave_pid} = $pid;
    $octave_object->{OCTIN} = $Oin;
    $octave_object->{OCTOUT} = $Oout;
+   $octave_object->{OCTERR} = $Oerr;
+   $octave_object->{SELECT} = $select;
 
    # some of this is necessary, some are the defaults
    # but it never hurts to be cautious
@@ -298,21 +310,28 @@ sub interpret
    my $cmd= shift;
    my $marker= $octave_object->{MARKER};
 
-   my $Oin= $octave_object->{OCTIN};
-   my $Oout= $octave_object->{OCTOUT};
+   my $Oin=    $octave_object->{OCTIN};
+   my $Oerr=   $octave_object->{OCTERR};
+   my $select= $octave_object->{SELECT};
 
-   croak "octave interpreter not alive"  unless $Oin and $Oout;
+   croak "octave interpreter not alive"  unless $Oin and $Oerr;
 
-#  DEBUG octave commands here
-#  print "INTERP: $cmd\n";
-
+#  print STDERR "INTERP: $cmd\n";
    print $Oin "\n\n$cmd\ndisp('$marker');fflush(stdout);\n";
 
    my $input;
    my $marker_len= length( $marker )+1;
-   while (1) {
-      my $line; sysread $Oout, $line, 1024;
-      $input.= $line;
+   while ( 1 ) {
+      for my $fh ( $select->can_read() ) {
+          if ($fh eq $Oerr) {
+              process_errors();
+          } else {
+              sysread $fh, (my $line), 16386;
+              $input.= $line;
+              # delay if we're reading nothing, not sure why select doesn't block
+              select undef, undef, undef, 0.5 unless $line;
+          }
+      }
       last if substr( $input, -$marker_len, -1) eq $marker;
    }   
 
@@ -320,7 +339,76 @@ sub interpret
    # otherwise it can't handle a CTRL-C
    print $Oin "\n\nfread(stdin,1);\n";
    return substr($input,0,-$marker_len);
-}   
+}
+
+# process any input of stderr
+# we assume that we will get a line with
+# error: or warning:
+sub process_errors
+{
+   my $Oerr=   $octave_object->{OCTERR};
+   my $select= IO::Select->new( $Oerr );
+
+   my $input= "\n";
+   # to get full error buffer, wait until we have 100ms with
+   # not stderr input
+   while ( my @fh = $select->can_read(0.1) ) {
+      sysread $fh[0], (my $line), 1024;
+      last unless $line;
+      $input.= $line;
+   }
+
+   #parse input, looking for warning and error patterns
+#  print STDERR "#########$input########\n";
+   my ($error, $warning);
+   while ($input =~ /\n (warning:|error:)  \s+
+                     (.*?)
+                   (?=
+                     ( \nwarning: \s+ | \nerror: \s+ | $) ) /gsx) {
+       my $type=    $1;
+       my $message= $2;
+          $message=~ s/[\012\015]+/ /gs; # turn newlines into spaces
+       if ($type eq "error:") {
+           $error.=   $message."; " if $message;
+       } else {
+           $warning.= $message."; " if $message;
+       }
+   }
+   carp  "$warning (in octave code)" if $warning;
+   croak "$error (in octave code)"   if $error;
+}
+
+
+# usage:
+# with return values:
+#   run_math_code ( $code, $val1, $val2 ... )
+# without return values:
+#   run_math_code ( $code )
+#    
+# dies on error, no return
+sub run_math_code
+{
+   my $code= shift;
+   my @v   = @_;
+
+   if (@v) {
+      my $vname= $v[0]->name;
+      $code.= "; disp (size($vname)==[3,1] && ".
+                " all($vname==$retcode_string') );\n";
+   } else {
+      $code.= "; disp (0);\n";
+   }
+
+   my $retval= Inline::Octave::interpret(0, $code );
+
+   if ($retval == 0) {
+      foreach my $v (@v) {
+         $v->store_size();
+      }
+   } else {
+      croak "Error performing operation $code";
+   }
+}
 
 sub get_defined_functions
 {
@@ -359,14 +447,15 @@ sub fix_octave_type
         return Inline::Octave::Matrix->new($m);
     }
 }
+
+# an Inline::Octave object is created here.
+# We try to switch to the correct underlying object
 sub new
 {
-   my $class = shift; #this is Inline::Octave, but we don't care
+   my $class = shift;
    my ($m, $rows, $cols) = @_;
 
-   if ( (ref($m) eq "Inline::Octave::Matrix"       ) or
-        (ref($m) eq "Inline::Octave::String"       ) or 
-        (ref($m) eq "Inline::Octave::ComplexMatrix") ) {
+   if ( ref($m) =~ /^Inline::Octave::/ ) {
       return fix_octave_type($m);
    }
    elsif ((ref $m eq "ARRAY") ||
@@ -374,6 +463,7 @@ sub new
           (ref $m eq "" ) ) {
           # here we have data or numbers, we write it
           # to a complex matrix just in case
+          # the fix_octave_type will set it correctly afterwards
       return fix_octave_type( Inline::Octave::ComplexMatrix->new($m) );
    } else {
       croak "Can't construct Inline::Octave from Perl var of type:".ref($m);
@@ -388,7 +478,7 @@ sub new
 # new IOS( "string" )
 # new IOS( ["1","2","3"] ) -> Strings as Matrix Rows
 package Inline::Octave::String;
-@ISA= qw( Inline::Octave::Matrix );
+@ISA= qw( Inline::Octave::Variable);
 use Carp;
 
 $varcounter= 30000001;
@@ -440,10 +530,29 @@ sub new
    return $self;
 }   
 
+package Inline::Octave::Math::Complex;
+use Math::Complex;
+
+# HACK ALERT
+# We can't use Math::Complex directry, because it doesn't give
+# us any way to not polute our namespace, and since
+# we define many of the same things, such as sqrt.
+#    This seems to break the inheritance model.
+# ie. If Inline::Octave::Matrix calls the sqrt function,
+# wanting to overload from Inline::Octave, it instead
+# gets its sqrt from Math::Complex. 
+#    So the plan is to use Math::Complex from a throw
+# away namespace. Then have utity functions call into
+# if from our real namespace.
+
 package Inline::Octave::ComplexMatrix;
 use Carp;
-use Math::Complex;
-@ISA= qw(Inline::Octave::Matrix);
+@ISA= qw(Inline::Octave::Matrix Inline::Octave::Variable);
+
+sub cplx { return Inline::Octave::Math::Complex::cplx(@_) };
+sub Re   { return Inline::Octave::Math::Complex::Re  (@_) };
+sub Im   { return Inline::Octave::Math::Complex::Im  (@_) };
+
 
 sub write_out_matrix {
    my $self=  shift;
@@ -477,7 +586,10 @@ sub write_out_matrix {
 # new IOM( [1,2,3,4], 2, 2) -> Matrix, rows, cols
 package Inline::Octave::Matrix;
 use Carp;
-use Math::Complex;
+@ISA= qw(Inline::Octave::Variable);
+sub cplx { return Inline::Octave::Math::Complex::cplx(@_) };
+sub Re   { return Inline::Octave::Math::Complex::Re  (@_) };
+sub Im   { return Inline::Octave::Math::Complex::Im  (@_) };
 
 $varcounter= 10000001;
 
@@ -495,36 +607,37 @@ sub new
    my $do_transpose= '';
    my $code;
 
-   if  ( (ref $m      eq "Inline::Octave::Matrix") ||
-         (ref $m      eq "Inline::Octave::String") ||
-         (ref $m      eq "Inline::Octave::ComplexMatrix") ) {
+   my $ref_m= ref($m);
+
+   if  ( $ref_m =~ /^Inline::Octave::/ ) {
       my $prev_varname= $m->{varname};
       $code= "$varname= $prev_varname;";
    }
-   elsif (ref $m      eq "ARRAY" and
+   elsif ($ref_m      eq "ARRAY" and
           ref $m->[0] eq "ARRAY" ) {
       # 2 dimentional array -  ensure all rows are equal size;
-      @vals= map {   if ($cols) {
-                 croak "specified cols is length ${@$_} not $cols"
-                    unless $cols== @$_;
-              } else {
-                 $cols = @$_;
-              };
-              @$_ } @$m;
+      @vals= map {
+                    if ($cols) {
+                       croak "specified cols is length ${@$_} not $cols"
+                          unless $cols== @$_;
+                    } else {
+                       $cols = @$_;
+                    };
+                    @$_
+                 } @$m;
       $rows= @$m unless defined $rows;
       $do_transpose= q(');
       ($rows,$cols)= ($cols,$rows);
    }
-   elsif (ref $m eq "ARRAY" ) {
+   elsif ($ref_m eq "ARRAY" ) {
       # 1 dimentional array;
       $rows= @$m unless defined $rows;
       $cols= 1 unless defined $cols;
       @vals= @{$m};
    }
-   elsif ((ref $m eq "Math::Complex") ||
-          (ref $m eq "" )) {
-          # here we have data or numbers, we write it
-          # to a complex matrix just in case
+   elsif ( ($ref_m eq "") or
+           ($ref_m eq "Math::Complex") ) {
+          # here we have data or numbers
       $rows= 1 unless defined $rows;
       $cols= 1 unless defined $cols;
       @vals = ($m);
@@ -546,6 +659,46 @@ sub new
    $self->store_size();
 
    return $self;
+   tie @array, $class, $self;
+   return \@array;
+}
+
+sub TIEARRAY {
+    my $class = shift;
+    my $self  = shift;
+    return bless $self, $class;
+}
+
+# fetch index is perl style (0 based), not octave style (1 based)
+sub FETCH {
+    my $self = shift;
+    my $index= shift() +1;
+    my $size = $self->{rows} * $self->{cols};
+    croak "index ($index) exceeds matrix size ($size)"
+       unless $index>0 && $index<=$size;
+    return $self->read_back_matrix("($index)")->[0];
+}
+
+sub FETCHSIZE {
+    my $self = shift;
+    return $self->{rows} * $self->{cols};
+}
+
+sub STORE {
+    die "can't store";
+}
+
+sub STORESIZE {
+    my $self = shift;
+    croak "can't change size of ".ref($self)." variables";
+}
+
+sub EXISTS {
+    my $self = shift;
+    my $index= shift() +1;
+    my $size = $self->{rows} * $self->{cols};
+    return 1 if $index>0 && $index<=$size;
+    return 0;
 }
 
 sub write_out_matrix {
@@ -560,6 +713,12 @@ sub write_out_matrix {
              pack( "d".($rows*$cols) , @$vals );
    return $code;
 }
+
+package Inline::Octave::Variable;
+use Carp;
+sub cplx { return Inline::Octave::Math::Complex::cplx(@_) };
+sub Re   { return Inline::Octave::Math::Complex::Re  (@_) };
+sub Im   { return Inline::Octave::Math::Complex::Im  (@_) };
 
 sub rows
 {
@@ -638,58 +797,79 @@ sub as_list
    return @$list;
 }
 
+# convert list to matrix: $list, $cols, $rows
+sub list_to_matrix
+{
+    my $list= shift;
+    my @idx = @_;
+    if    ( @idx==1 || $idx[0]==1 || $idx[1]==1 ){
+        return $list;
+    }
+    elsif ( @idx==2 ){
+       my @m;
+       for (0..$idx[1]-1) {
+          my @index= $_*$idx[0] .. ($_+1)*$idx[0]-1;
+          push @m, [ @$list[@index] ];
+       }
+       return \@m;
+    }
+    else {
+        die "can't handle more than 2D matrices"
+    }
+}
+
 sub as_matrix
 {
    my $self = shift;
-   my @list= @{ $self->read_back_matrix("'") };
-   my @m;
-   my $cols= $self->cols();
-   my $rows= $self->rows();
-   for (0..$rows-1) {
-      push @m, [ (@list)[$_*$cols .. ($_+1)*$cols-1] ];
-   }
-   return \@m;
+   return list_to_matrix(
+       $self->read_back_matrix("'"),
+       $self->cols(),
+       $self->rows() );
 }
 
 # $oct_var->sub_matrix( $row_spec, $col_spec )
+sub idx { return sub_matrix( @_ ) }
 sub sub_matrix
 {
    my $self = shift;
 
-   my $row_specv = new Inline::Octave::Matrix( shift );
-   my $row_specn = $row_specv->name;
-   my $col_specv = new Inline::Octave::Matrix( shift );
-   my $col_specn = $col_specv->name;
+   my @specv; my @specn;
+   for ( @_ ) {
+       my $specv = new Inline::Octave( $_ );
+       my $specn = $specv->name;
+       push @specv, $specv;
+       push @specn, $specn;
+   }
 
-   my @list= @{ $self->read_back_matrix("($row_specn,$col_specn)'") };
+   my $spec= "(". join(",",@specn). ")'";
+   my @list= @{ $self->read_back_matrix( $spec ) };
    my @m;
-   my $cols= $col_specv->max_dim();
-   my $rows= $row_specv->max_dim();
-   for (0..$rows-1) {
-      push @m, [ (@list)[$_*$cols .. ($_+1)*$cols-1] ];
+   my $cols= $specv[0]->max_dim();
+   my $rows= $specv[1]->max_dim();
+   for (0..$cols-1) {
+      push @m, [ (@list)[$_*$rows .. ($_+1)*$rows-1] ];
    }
    return \@m;
+   return list_to_matrix(
+       $self->read_back_matrix("'"),
+       map { $_->max_dim() } @specv );
 }
 
 
 sub as_scalar
 {
    my $self = shift;
-   my $varname= $self->name;
-   croak "Can't handle complex" if $self->{complex};
    croak "requested as_scalar for non scalar value:".
            $self->cols()."x".$self->rows()
            unless $self->cols() == 1 && $self->rows() == 1;
-   my $code = "fwrite(stdout, $varname,'double');";
-   my $retval= Inline::Octave::interpret(0, $code );
-   my @list= unpack "d1", $retval;
-   return $list[0];
+   my $list = $self->read_back_matrix();
+   return $list->[0];
 }   
 
 sub DESTROY
 {
-#  print "DESTROYing $varname\n";
    my $self = shift;
+#  use Data::Dumper; print "DESTROYing ". Dumper($self)."\n";
    my $varname= $self->name;
    my $code = "clear $varname;";
    Inline::Octave::interpret(0, $code );
@@ -729,68 +909,62 @@ sub oct_matrix_arithmetic
    ($b,$a)= ($a,$b) if shift;
    my $op= shift;
 
-   my $v= Inline::Octave::Matrix->new( $retcode_value );
+   my $v= Inline::Octave->new( $retcode_value );
 
    my $code= $v->name."=". $a->name ." $op ". $b->name .';';
-   run_math_code( $code, $v);
+   Inline::Octave::run_math_code( $code, $v);
    return Inline::Octave->new($v);
 }   
 
 # usage
-# $a= new Inline::Octave::Matrix ( ...)
+# $a= new Inline::Octave ( ...)
 # $b= $a->transpose();
 sub transpose
 {
-   my $a= new Inline::Octave::Matrix( shift );
-   my $v= new Inline::Octave::Matrix( $retcode_value );
+   my $a= new Inline::Octave( shift );
+   my $v= new Inline::Octave( $retcode_value );
    my $code= $v->name."=". $a->name.".';";
-   run_math_code( $code, $v);
+   Inline::Octave::run_math_code( $code, $v);
    return $v;
 }  
 
 # usage
-# $a = Inline::Octave::Matrix::zeros(4);
+# $a = Inline::Octave::zeros(4);
 # $a->replace_rows( [1,3], [ [1,2,3,4],[5,6,7,8] ] );
 sub replace_rows
 {
    my $a= shift;
-   die "argument must be Inline:Octave:Matrix"
-      unless (ref $a eq "Inline::Octave::Matrix");
-   my $b= new Inline::Octave::Matrix( shift );
-   my $c= new Inline::Octave::Matrix( shift );
+   my $b= new Inline::Octave( shift );
+   my $c= new Inline::Octave( shift );
    my $code= $a->name."(". $b->name.",:)= ".$c->name.";";
-   run_math_code( $code );
+   Inline::Octave::run_math_code( $code );
    return;
 }
 
 # usage
-# $a = Inline::Octave::Matrix::zeros(4);
+# $a = Inline::Octave::zeros(4);
 # $a->replace_cols( [2,4], [ [2,4],[2,4],[2,4],[2,4] ] );
 sub replace_cols
 {
    my $a= shift;
-   die "argument must be Inline:Octave:Matrix"
-      unless (ref $a eq "Inline::Octave::Matrix");
-   my $b= new Inline::Octave::Matrix( shift );
-   my $c= new Inline::Octave::Matrix( shift );
+   my $b= new Inline::Octave( shift );
+   my $c= new Inline::Octave( shift );
    my $code= $a->name."(:,". $b->name.")= ".$c->name.";";
-   run_math_code( $code );
+   Inline::Octave::run_math_code( $code );
    return;
 }
 
 # usage
-# $a = Inline::Octave::Matrix::zeros(4);
+# $a = Inline::Octave::zeros(4);
 # $a->replace_matrix( [1,4], [1,4], [ [8,7],[6,5] ] );
 sub replace_matrix
 {
    my $a= shift;
-   die "argument must be Inline:Octave:Matrix"
-      unless (ref $a eq "Inline::Octave::Matrix");
-   my $b= new Inline::Octave::Matrix( shift );
-   my $c= new Inline::Octave::Matrix( shift );
-   my $d= new Inline::Octave::Matrix( shift );
+   my $b= new Inline::Octave( shift );
+   my $c= new Inline::Octave( shift );
+   my $d= new Inline::Octave( shift );
    my $code= $a->name."(". $b->name." , ".$c->name.")= ".$d->name.";";
-   run_math_code( $code );
+   Inline::Octave::run_math_code( $code );
    return;
 }
 
@@ -799,9 +973,9 @@ sub replace_matrix
 #
 
 # include guard
-$Inline::Octave::methods_defined=0;
+BEGIN{$Inline::Octave::methods_defined=0;}
 unless ($Inline::Octave::methods_defined) {
-   $Inline::Octave::methods_defined=0;
+   $Inline::Octave::methods_defined=1;
 
    my %methods= (
       abs           => 1, acos          => 1, acosh         => 1,
@@ -830,6 +1004,12 @@ unless ($Inline::Octave::methods_defined) {
       tanh          => 1, zeros         => 1,
    );
 
+   # methods to export to Inline::Octave namespace
+   my %export_methods= (
+    "eye"      =>1, "linspace" =>1, "logspace" =>1,
+    "ones"     =>1, "rand"     =>1, "randn"    =>1,
+    "zeros"    =>1, );
+
    for my $meth ( sort keys %methods ) {
       no strict 'refs';
       no warnings 'redefine';
@@ -839,7 +1019,7 @@ unless ($Inline::Octave::methods_defined) {
 
          my @v;
          foreach (1..$nargout) {
-            my $v= new Inline::Octave::Matrix( $retcode_value );
+            my $v= new Inline::Octave( $retcode_value );
             $code.= $v->name.",";
             push @v,$v;
          }
@@ -848,50 +1028,22 @@ unless ($Inline::Octave::methods_defined) {
 
          my @a;
          foreach (@_) {
-            my $a= new Inline::Octave::Matrix( $_ );
+            my $a= new Inline::Octave( $_ );
             $code.= $a->name.",";
             push @a, $a;
          }
          chop ($code); #remove last ','
          $code.= ");";
 
-         run_math_code( $code, @v);
+         Inline::Octave::run_math_code( $code, @v);
          return @v if wantarray();
          return $v[0];
-      }
+      };
+      
+      my $IOmeth= "Inline::Octave::$meth";
+      *$IOmeth = *$meth if $export_methods{$meth};
    }
 }
-
-# usage:
-# with return values:
-#   run_math_code ( $code, $val1, $val2 ... )
-# without return values:
-#   run_math_code ( $code )
-#    
-# dies on error, no return
-sub run_math_code
-{
-   my $code= shift;
-   my @v   = @_;
-
-   if (@v) {
-      my $vname= $v[0]->name;
-      $code.= "; disp (size($vname)==[3,1] && ".
-                " all($vname==$retcode_string') );\n";
-   } else {
-      $code.= "; disp (0);\n";
-   }
-
-   my $retval= Inline::Octave::interpret(0, $code );
-
-   if ($retval == 0) {
-      foreach my $v (@v) {
-         $v->store_size();
-      }
-   } else {
-      croak "Error performing operation $code";
-   }
-}      
 
 1;
 
@@ -907,6 +1059,7 @@ TODO LIST:
    4. control waiting in the interpret loop
        - seems ok, except sysread reads small buffers
    5. support for complex variables
+       - done
    6. octave gets wierd when you CTRL-C out of a 
        running program
        - seems ok
@@ -914,12 +1067,32 @@ TODO LIST:
    8. Come up with an OO way to avoid
        Inline::Octave::interpret(0, $code );
    9. Add support for passing Strings to Octave
+        - done
   10. Errors in Octave should die in perl
        - this involves a tricky Open3 read of stderr.
   11. Refactor out the common code in Inline::Octave::Matrix
        into an Inline::Octave::Variable class
+       - done
 
 $Log: Octave.pm,v $
+Revision 1.23  2003/12/04 19:22:27  aadler
+working errors and warnings
+
+Revision 1.22  2003/12/04 18:20:07  aadler
+does warnings right
+
+Revision 1.21  2003/12/03 16:46:31  aadler
+move to IO::Variable class
+
+Revision 1.20  2003/12/01 03:46:21  aadler
+tried to tie to an array ref. Didn't work
+
+Revision 1.19  2003/11/30 14:33:02  aadler
+cleanups of OO interface
+
+Revision 1.18  2003/03/20 03:40:26  aadler
+fix whos handling
+
 Revision 1.17  2003/01/07 02:47:49  aadler
 mods to remove warnings from tests
 
@@ -974,7 +1147,7 @@ Inline::Octave - Inline octave code into your perl
    $f = jnk1(3);
    print "jnk1=",$f->disp(),"\n";
 
-   $c= new Inline::Octave::Matrix([ [1.5,2,3],[4.5,1,-1] ]);
+   $c= new Inline::Octave([ [1.5,2,3],[4.5,1,-1] ]);
    
    ($b, $t)= jnk2( $c, [4,4],[5,6] );
    print "t=",$t->as_list(),"\n";
@@ -1017,7 +1190,7 @@ Basically, I create an octave process with controlled stdin and stdout.
 Commands send by stdin. Data is send by stdin and read with
 fread(stdin, [dimx dimy], "double"), and read similarly.
                    
-Inline::Octave::Matrix variables in perl are tied to the octave
+Inline::Octave variables in perl are tied to the octave
 variable. When a destructor is called, it sends a "clear varname"
 command to octave.
 
@@ -1163,6 +1336,8 @@ perl code. This can be accomplished using:
 1. $oct_var->disp()
 
 Returns a string of the disp output from octave
+This provides a formatted representation, and should mostly
+be useful for debugging.
 
 2. $oct_var->as_list()
 
@@ -1183,28 +1358,35 @@ Returns a perl scalar if $oct_var
 is a 1x1 matrix, dies with an error otherwise
 
 5. $oct_var->sub_matrix( $row_spec, $col_spec )
+Returns the sub matrix specified
 
-Returns the sub
-$x= Inline::Octave::Matrix->new([1,2,3,4]);
-$y=$x x $x->transpose();
-$y->sub_matrix( [2,4], [2,3] )'
+    $x= Inline::Octave->new([1,2,3,4]);
+    $y=$x x $x->transpose();
+    $y->sub_matrix( [2,4], [2,3] )'
 
-gives:  [ [4,6],[8,9] ]
+    gives:  [ [4,6],[8,9] ]
 
-Returns the sub matrix of
-
-=head1 Using Inline::Octave::Matrix
+=head1 Using Inline::Octave variables
 
 Inline::Octave::Matrix is the matrix class that "ties"
 matrices held by octave to perl variables.
-(but not using the Perl "tie" mechanism)
 
 Values can be created explicitly, using the syntax:
 
-   $var= new Inline::Octave::Matrix([ [1.5,2,3],[4.5,1,-1] ]);
+   $var= new Inline::Octave([ [1.5,2,3],[4.5,1,-1] ]);
+
+or 
+
+   $var= Inline::Octave->new([ [1.5,2,3],[4.5,1,-1] ]);
 
 or values will be automatically created by 
 calling octave functions.
+
+If your code only uses matrixes, and does not need to define
+any octave functions, then the following initialization
+syntax may be useful:
+
+    use Inline Octave =>" ";
 
 =head1 Operations on Inline::Octave::Matrix -es
 
@@ -1232,7 +1414,7 @@ variables, and the underlying octave function is called.
 
 for example:
 
-   my $b= new Inline::Octave::Matrix( 1 );
+   my $b= new Inline::Octave( 1 );
    $s= 4 * ($b->atan());
    my $pi=  $s->as_scalar;
 
@@ -1355,12 +1537,12 @@ and only pull back small matrices into perl.
 
 =head1 AUTHOR
 
-Andy Adler andy@analyti.ca
+Andy Adler   adler at site dot uottawa dot ca
 
 
 =head1 COPYRIGHT
 
-© MMII, Andy Adler
+© MMIII, Andy Adler
 
 All Rights Reserved. This module is free software. It may be used,
 redistributed and/or modified under the same terms as Perl itself.
