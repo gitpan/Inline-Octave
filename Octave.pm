@@ -2,7 +2,7 @@
 #
 # Inline::Octave - 
 #
-# $Id: Octave.pm,v 1.11 2001/11/21 03:20:54 aadler Exp $
+# $Id: Octave.pm,v 1.13 2002/01/19 01:08:35 aadler Exp $
 
 package Inline::Octave;
 
@@ -251,6 +251,7 @@ silent_functions=1;
 do_fortran_indexing=1; 
 page_screen_output=0;
 page_output_immediately=1;
+empty_list_elements_ok=1;
 STARTUP_CODE
 
    $o->interpret( $startup_code ); # check return value?
@@ -303,6 +304,7 @@ sub interpret
 
    croak "octave interpreter not alive"  unless $Oin and $Oout;
 
+#  DEBUG octave commands here
 #  print "INTERP: $cmd\n";
 
    print $Oin "\n\n$cmd\ndisp('$marker');fflush(stdout);\n";
@@ -339,14 +341,18 @@ END {
    Inline::Octave::stop_interpreter() if $octave_object;
 }
 
-package Inline::Octave::Matrix;
+#
+# Inline::Octave::String contains the code
+# to handle octave String objects
+#
+# called as
+# new IOS( "string" )
+# new IOS( ["1","2","3"] ) -> Strings as Matrix Rows
+package Inline::Octave::String;
+@ISA= qw( Inline::Octave::Matrix );
 use Carp;
 
-$varcounter= 10000001;
-# called as
-# new IOM( [1,2,3] ) -> ColumnVector
-# new IOM( [[1,2],[2,3],[3,4]] ) -> Matrix
-# new IOM( [1,2,3,4], 2, 2) -> Matrix, rows, cols
+$varcounter= 30000001;
 
 sub new
 {
@@ -355,7 +361,67 @@ sub new
    my $self = {};
    bless ($self, $class);
 
-   my $varname= "vname_".$varcounter++;
+   my $varname= "sname_".$varcounter++;
+   $self->{varname}= $varname;
+
+   my $code;
+   my @vals;
+
+   if    (ref $m      eq "Inline::Octave::String") {
+      my $prev_varname= $m->{varname};
+      $code= "$varname= $prev_varname;";
+   }
+   elsif (ref $m eq "ARRAY" ) {
+      # 1 dimentional array;
+      $rows= @$m unless defined $rows;
+      $cols= 1 unless defined $cols;
+      @vals= @{$m};
+   }
+   elsif (ref $m eq "" ) {
+      $rows= 1 unless defined $rows;
+      $cols= 1 unless defined $cols;
+      @vals = ($m);
+   } else {
+      croak "Can't construct String from Perl var of type:".ref($m);
+   }
+
+   unless ($code) {
+      croak "String Matrix is not size ${cols}x${rows}" unless
+             @vals == $rows*$cols ;
+
+      $code= "$varname=[ ...\n";
+      $code.= "'$_';\n" for @vals;
+      $code.= "];\n";
+   }
+
+   Inline::Octave::interpret(0, $code );
+
+   $self->store_size();
+
+   return $self;
+}   
+
+#
+# Inline::Octave::Matrix contains the code
+# to handle octave Matrix objects
+#
+# called as
+# new IOM( [1,2,3] ) -> ColumnVector
+# new IOM( [[1,2],[2,3],[3,4]] ) -> Matrix
+# new IOM( [1,2,3,4], 2, 2) -> Matrix, rows, cols
+package Inline::Octave::Matrix;
+use Carp;
+
+$varcounter= 10000001;
+
+sub new
+{
+   my $class = shift;
+   my ($m, $rows, $cols) = @_;
+   my $self = {};
+   bless ($self, $class);
+
+   my $varname= "mname_".$varcounter++;
    $self->{varname}= $varname;
 
    my @vals;
@@ -363,6 +429,10 @@ sub new
    my $code;
 
    if    (ref $m      eq "Inline::Octave::Matrix") {
+      my $prev_varname= $m->{varname};
+      $code= "$varname= $prev_varname;";
+   }
+   elsif (ref $m      eq "Inline::Octave::String") {
       my $prev_varname= $m->{varname};
       $code= "$varname= $prev_varname;";
    }
@@ -393,34 +463,63 @@ sub new
    } else {
       croak "Can't construct Matrix from Perl var of type:".ref($m);
    }
-   croak "Matrix is not size ${cols}x${rows}" unless
-                (ref $m eq "Inline::Octave::Matrix")
-                || (@vals == $rows*$cols) ;
 
    # pack data into doubles and use fread to grab it from octave
    # since octave is column major and nested lists in perl are
    # row major, we need to do the transpose.
    unless ($code) {
+      croak "Matrix is not size ${cols}x${rows}" unless
+             @vals == $rows*$cols ;
+
       $code= "$varname=fread(stdin,[$rows,$cols],'double')$do_transpose;\n".
              pack( "d".($rows*$cols) , @vals );
    }
-
    Inline::Octave::interpret(0, $code );
+
    $self->store_size();
 
    return $self;
-}   
+}
+
+sub rows
+{
+   my $self= shift;
+   return $self->{rows};
+}
+
+sub cols
+{
+   my $self= shift;
+   return $self->{cols};
+}
+
+sub max_dim
+{
+   my $self= shift;
+   my $rows= $self->{rows};
+   my $cols= $self->{cols};
+
+   return ( $rows > $cols ) ? $rows : $cols ;
+}
+
+sub elements
+{
+   my $self= shift;
+   return $self->{cols} * $self->{rows};
+}
 
 sub store_size
 {
    my $self = shift;
    my $varname= $self->name;
-   my $code = "disp([size($varname), is_complex($varname)] )";
+   my $code = "disp([size($varname), is_complex($varname), isstr($varname)] )";
    my $size=  Inline::Octave::interpret(0, $code );
-   croak "Problem constructing Matrix" unless $size =~ /^ +(\d+) +(\d+) +([01])/;
+   croak "Problem constructing Matrix" unless
+       $size =~ /^ +(\d+) +(\d+) +([01]) +([01])/;
    $self->{rows}= $1;
    $self->{cols}= $2;
    $self->{complex}= $3;
+   $self->{string}= $4;
 }             
 
 sub as_list
@@ -430,7 +529,7 @@ sub as_list
    croak "Can't handle complex" if $self->{complex};
    my $code = "fwrite(stdout, $varname,'double');";
    my $retval= Inline::Octave::interpret(0, $code );
-   my $size= $self->{cols} * $self->{rows};
+   my $size= $self->elements();
    my @list= unpack "d$size", $retval;
    return @list;
 }
@@ -442,16 +541,42 @@ sub as_matrix
    croak "Can't handle complex" if $self->{complex};
    my $code = "fwrite(stdout, $varname','double');"; # use transpose
    my $retval= Inline::Octave::interpret(0, $code );
-   my $size= $self->{cols} * $self->{rows};
+   my $size= $self->elements();
    my @list= unpack "d$size", $retval;
    my @m;
-   my $cols= $self->{cols};
-   my $rows= $self->{rows};
+   my $cols= $self->cols();
+   my $rows= $self->rows();
    for (0..$rows-1) {
       push @m, [ (@list)[$_*$cols .. ($_+1)*$cols-1] ];
    }
    return \@m;
 }
+
+# $oct_var->sub_matrix( $row_spec, $col_spec )
+sub sub_matrix
+{
+   my $self = shift;
+
+   my $row_specv = new Inline::Octave::Matrix( shift );
+   my $row_specn = $row_specv->name;
+   my $col_specv = new Inline::Octave::Matrix( shift );
+   my $col_specn = $col_specv->name;
+
+   my $varname= $self->name;
+   croak "Can't handle complex" if $self->{complex};
+   my $code = "fwrite(stdout, $varname($row_specn,$col_specn)','double');";
+   my $retval= Inline::Octave::interpret(0, $code );
+   my $size= $self->elements();
+   my @list= unpack "d$size", $retval;
+   my @m;
+   my $cols= $col_specv->max_dim();
+   my $rows= $row_specv->max_dim();
+   for (0..$rows-1) {
+      push @m, [ (@list)[$_*$cols .. ($_+1)*$cols-1] ];
+   }
+   return \@m;
+}
+
 
 sub as_scalar
 {
@@ -459,8 +584,8 @@ sub as_scalar
    my $varname= $self->name;
    croak "Can't handle complex" if $self->{complex};
    croak "requested as_scalar for non scalar value:".
-           $self->{cols}."x".$self->{rows}
-           unless $self->{cols} == 1 && $self->{rows} == 1;
+           $self->cols()."x".$self->rows()
+           unless $self->cols() == 1 && $self->rows() == 1;
    my $code = "fwrite(stdout, $varname,'double');";
    my $retval= Inline::Octave::interpret(0, $code );
    my @list= unpack "d1", $retval;
@@ -515,6 +640,9 @@ sub oct_matrix_arithmetic
    return $v;
 }   
 
+# usage
+# $a= new Inline::Octave::Matrix ( ...)
+# $b= $a->transpose();
 sub transpose
 {
    my $a= new Inline::Octave::Matrix( shift );
@@ -523,6 +651,52 @@ sub transpose
    run_math_code( $code, $v);
    return $v;
 }  
+
+# usage
+# $a = Inline::Octave::Matrix::zeros(4);
+# $a->replace_rows( [1,3], [ [1,2,3,4],[5,6,7,8] ] );
+sub replace_rows
+{
+   my $a= shift;
+   die "argument must be Inline:Octave:Matrix"
+      unless (ref $a eq "Inline::Octave::Matrix");
+   my $b= new Inline::Octave::Matrix( shift );
+   my $c= new Inline::Octave::Matrix( shift );
+   my $code= $a->name."(". $b->name.",:)= ".$c->name.";";
+   run_math_code( $code );
+   return;
+}
+
+# usage
+# $a = Inline::Octave::Matrix::zeros(4);
+# $a->replace_cols( [2,4], [ [2,4],[2,4],[2,4],[2,4] ] );
+sub replace_cols
+{
+   my $a= shift;
+   die "argument must be Inline:Octave:Matrix"
+      unless (ref $a eq "Inline::Octave::Matrix");
+   my $b= new Inline::Octave::Matrix( shift );
+   my $c= new Inline::Octave::Matrix( shift );
+   my $code= $a->name."(:,". $b->name.")= ".$c->name.";";
+   run_math_code( $code );
+   return;
+}
+
+# usage
+# $a = Inline::Octave::Matrix::zeros(4);
+# $a->replace_matrix( [1,4], [1,4], [ [8,7],[6,5] ] );
+sub replace_matrix
+{
+   my $a= shift;
+   die "argument must be Inline:Octave:Matrix"
+      unless (ref $a eq "Inline::Octave::Matrix");
+   my $b= new Inline::Octave::Matrix( shift );
+   my $c= new Inline::Octave::Matrix( shift );
+   my $d= new Inline::Octave::Matrix( shift );
+   my $code= $a->name."(". $b->name." , ".$c->name.")= ".$d->name.";";
+   run_math_code( $code );
+   return;
+}
 
 #
 # create methods for the various math functions
@@ -546,8 +720,9 @@ sub transpose
       isfinite      => 1, isieee        => 1, isinf         => 1,
       islogical     => 1, isnan         => 1, isnumeric     => 1,
       isreal        => 1, length        => 1, lgamma        => 1,
-      linspace      => 2, log           => 1, log10         => 1,
-      ones          => 1, prod          => 1, real          => 1,
+      linspace      => 1, log           => 1, log10         => 1,
+      logspace      => 1, ones          => 1, prod          => 1,
+      rand          => 1, randn         => 1, real          => 1,
       round         => 1, sign          => 1, sin           => 1,
       sinh          => 1, size          => 2, sqrt          => 1,
       sum           => 1, sumsq         => 1, tan           => 1,
@@ -585,17 +760,27 @@ sub transpose
    }
 }
 
-# run_math_code ( $code, $val1, $val2 ... )
+# usage:
+# with return values:
+#   run_math_code ( $code, $val1, $val2 ... )
+# without return values:
+#   run_math_code ( $code )
+#    
 # dies on error, no return
 sub run_math_code
 {
    my $code= shift;
    my @v   = @_;
-   my $vname= $v[0]->name;
 
-   $runcode= "$code  disp (size($vname)==[3,1] && ".
-             " all($vname==$retcode_string') );\n";
-   my $retval= Inline::Octave::interpret(0, $runcode );
+   if (@v) {
+      my $vname= $v[0]->name;
+      $code.= "; disp (size($vname)==[3,1] && ".
+                " all($vname==$retcode_string') );\n";
+   } else {
+      $code.= "; disp (0);\n";
+   }
+
+   my $retval= Inline::Octave::interpret(0, $code );
 
    if ($retval == 0) {
       foreach my $v (@v) {
@@ -626,8 +811,16 @@ TODO LIST:
    7. Use parse-recdecent to parse octave code
    8. Come up with an OO way to avoid
        Inline::Octave::interpret(0, $code );
+   9. Add support for passing Strings to Octave
+  10. Errors in Octave should die in perl
 
 $Log: Octave.pm,v $
+Revision 1.13  2002/01/19 01:08:35  aadler
+new docs and new matrix methods
+
+Revision 1.12  2002/01/17 01:28:33  aadler
+added Inline::Octave::String
+
 Revision 1.11  2001/11/21 03:20:54  aadler
 fixed make bug, added method support for IOMs
 
@@ -726,8 +919,13 @@ I'm planning to get back to that eventually ...
 =head2 Platforms
 
   I've succeded in getting this to work on win2k (activeperl), 
-  and linux (Mandrake 8.0, Redhat 6.2, Debian 2.0). Please
-  send me tales of success or failure on other platforms
+  win2k cygwin (but Inline-0.43 can't install Inline::C)
+  and linux (Mandrake 8.0, Redhat 6.2, Debian 2.0).
+
+  Note that Inline-0.43 can't handle spaces in your path -
+  this is a big pain for windows users.
+  
+  Please send me tales of success or failure on other platforms
 
 =head2 Install Proceedure  
 
@@ -864,9 +1062,21 @@ form
 Returns a perl scalar if $oct_var
 is a 1x1 matrix, dies with an error otherwise
 
+5. $oct_var->sub_matrix( $row_spec, $col_spec )
+
+Returns the sub
+$x= Inline::Octave::Matrix->new([1,2,3,4]);
+$y=$x x $x->transpose();
+$y->sub_matrix( [2,4], [2,3] )'
+
+gives:  [ [4,6],[8,9] ]
+
+Returns the sub matrix of
+
 =head1 Using Inline::Octave::Matrix
 
 Inline::Octave::Matrix is the matrix class that "ties"
+matrices held by octave to perl variables.
 (but not using the Perl "tie" mechanism)
 
 Values can be created explicitly, using the syntax:
@@ -900,38 +1110,95 @@ The relation between Perl and Octave operators is:
 Methods can be called on Inline::Octave::Matrix
 variables, and the underlying octave function is called.
 
+for example:
+
    my $b= new Inline::Octave::Matrix( 1 );
    $s= 4 * ($b->atan());
-   print $s->as_scalar;
+   my $pi=  $s->as_scalar;
 
 Is a labourious way to calculate PI.
+
+Additionally, it is possible to call these as functions
+instead of methods
+
+for example:
+
+   $c= Inline::Octave::Matrix::rand(2,3);
+   print $c->disp();
+
+gives:
+
+  0.23229  0.50674  0.25243
+  0.96019  0.17037  0.39687
+
 
 The following methods are available, the corresponding
 number is the output args available (nargout).
 
-      abs       => 1    acos      => 1    acosh      => 1
-      all       => 1    angle     => 1    any        => 1
-      asin      => 1    asinh     => 1    atan       => 1
-      atan2     => 1    atanh     => 1    ceil       => 1
-      conj      => 1    cos       => 1    cosh       => 1
-      cumprod   => 1    cumsum    => 1    diag       => 1
-      erf       => 1    erfc      => 1    exp        => 1
-      eye       => 1    finite    => 1    fix        => 1
-      floor     => 1    gamma     => 1    gammaln    => 1
-      imag      => 1    is_bool   => 1    is_complex => 1
-      is_global => 1    is_list   => 1    is_matrix  => 1
-      is_stream => 1    is_struct => 1    isalnum    => 1
-      isalpha   => 1    isascii   => 1    iscell     => 1
-      iscntrl   => 1    isdigit   => 1    isempty    => 1
-      isfinite  => 1    isieee    => 1    isinf      => 1
-      islogical => 1    isnan     => 1    isnumeric  => 1
-      isreal    => 1    length    => 1    lgamma     => 1
-      linspace  => 2    log       => 1    log10      => 1
-      ones      => 1    prod      => 1    real       => 1
-      round     => 1    sign      => 1    sin        => 1
-      sinh      => 1    size      => 2    sqrt       => 1
-      sum       => 1    sumsq     => 1    tan        => 1
-      tanh      => 1    zeros     => 1
+      abs         => 1   acos        => 1   acosh       => 1  
+      all         => 1   angle       => 1   any         => 1  
+      asin        => 1   asinh       => 1   atan        => 1  
+      atan2       => 1   atanh       => 1   ceil        => 1  
+      conj        => 1   cos         => 1   cosh        => 1  
+      cumprod     => 1   cumsum      => 1   diag        => 1  
+      erf         => 1   erfc        => 1   exp         => 1  
+      eye         => 1   finite      => 1   fix         => 1  
+      floor       => 1   gamma       => 1   gammaln     => 1  
+      imag        => 1   is_bool     => 1   is_complex  => 1  
+      is_global   => 1   is_list     => 1   is_matrix   => 1  
+      is_stream   => 1   is_struct   => 1   isalnum     => 1  
+      isalpha     => 1   isascii     => 1   iscell      => 1  
+      iscntrl     => 1   isdigit     => 1   isempty     => 1  
+      isfinite    => 1   isieee      => 1   isinf       => 1  
+      islogical   => 1   isnan       => 1   isnumeric   => 1  
+      isreal      => 1   length      => 1   lgamma      => 1  
+      linspace    => 1   log         => 1   log10       => 1  
+      logspace    => 1   ones        => 1   prod        => 1  
+      rand        => 1   randn       => 1   real        => 1  
+      round       => 1   sign        => 1   sin         => 1  
+      sinh        => 1   size        => 2   sqrt        => 1  
+      sum         => 1   sumsq       => 1   tan         => 1  
+      tanh        => 1   zeros       => 1  
+
+=head2 Manipulating Inline::Octave::Matrix -es
+
+If you would like to do the octave equivalent of
+
+   a=zeros(4);
+   a( [1,3] , :)= [ 1,2,3,4 ; 5,6,7,8 ];
+   a( : , [2,4])= [ 2,4; 2,4; 2,4; 2,4 ];
+   a( [1,4],[1,4])= [8,7;6,5];
+
+Then these methods will make life more convenient.
+
+   $a = Inline::Octave::Matrix::zeros(4);
+
+   $a->replace_rows( [1,3], [ [1,2,3,4],[5,6,7,8] ] );
+
+   $a->replace_cols( [2,4], [ [2,4],[2,4],[2,4],[2,4] ] );
+
+   $a->replace_matrix( [1,4], [1,4], [ [8,7],[6,5] ] );
+
+=head1 Using Inline::Octave::String
+
+Inline::Octave::String is a subclass of Inline::Octave::Matrix
+used for octave strings.  It is required because there is
+no way to explicity create a string from Inline::Octave::Matrix.
+
+Example:
+
+   use Inline Octave => q{
+      function out = countstr( str )
+         out= "";
+         for i=1:size(str,1)
+            out= [out,sprintf("idx=%d row=(%s)\n",i, str(i,:) )];
+         end
+      endfunction
+   };
+
+   $str= new Inline::Octave::String([ "asdf","b","4523","end" ] );
+   $x=   countstr( $str );
+   print $x->disp();
 
 =head1 PERFORMANCE
 
@@ -953,7 +1220,7 @@ Andy Adler andy@analyti.ca
 
 =head1 COPYRIGHT
 
-© MMI, Andy Adler
+© MMII, Andy Adler
 
 All Rights Reserved. This module is free software. It may be used,
 redistributed and/or modified under the same terms as Perl itself.
