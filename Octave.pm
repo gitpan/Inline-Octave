@@ -2,17 +2,18 @@
 #
 # Inline::Octave - 
 #
-# $Id: Octave.pm,v 1.23 2003/12/04 19:22:27 aadler Exp $
+# $Id: Octave.pm,v 1.25 2004/04/12 17:11:17 aadler Exp $
 
 package Inline::Octave;
 
-$VERSION = '0.20';
+$VERSION = '0.21';
 require Inline;
 @ISA = qw(Inline);
 use Carp;
 use IO::File;
 use IPC::Open3;
 use IO::Select;
+use POSIX 'WNOHANG';
 use vars qw( $octave_object );
 
 # set values which should change to this,
@@ -242,9 +243,6 @@ sub start_interpreter
    # ignore errors from setpriority if it's not available
    croak "Can't locate octave interpreter: $@\n" if $@ =~ /Open3/i;
 
-   $SIG{CHLD}= \&reap_interpreter;
-   $SIG{PIPE}= \&reap_interpreter;
-
    my $select= IO::Select->new($Oout, $Oerr);
 
    $octave_object->{octave_pid} = $pid;
@@ -270,6 +268,14 @@ STARTUP_CODE
    return;
 }
 
+# we get here from a SIG{CHLD} or a SIG{PIPE}.
+# if it's the octave process, then we want to deal
+# with it, if it isn't, then we want to pass it to
+# the calling processes handler. But how can we
+# do that reliably?
+#
+# instead we just reap any dead processes
+
 sub reap_interpreter
 {
 #  print "REAP_INTERPRETER\n";
@@ -277,10 +283,16 @@ sub reap_interpreter
    my $pid= $octave_object->{octave_pid};
    return unless $pid;
 
-   waitpid $pid,0;
-   $octave_object->{OCTIN} = "";
-   $octave_object->{OCTOUT} = "";
-   $octave_object->{octave_pid} = "";
+   if ( waitpid($pid, WNOHANG) > 0 ) {
+       $octave_object->{OCTIN} = "";
+       $octave_object->{OCTOUT} = "";
+       $octave_object->{octave_pid} = "";
+   }
+
+   while (
+      ( my $reaped = waitpid (-1, WNOHANG) ) > 0
+         ) { };
+
    return;
 }   
 
@@ -315,6 +327,11 @@ sub interpret
    my $select= $octave_object->{SELECT};
 
    croak "octave interpreter not alive"  unless $Oin and $Oerr;
+
+#  set SIGnals here, and they will be reset to what the
+#  user set them to outside
+   local $SIG{CHLD}= \&reap_interpreter;
+   local $SIG{PIPE}= \&reap_interpreter;
 
 #  print STDERR "INTERP: $cmd\n";
    print $Oin "\n\n$cmd\ndisp('$marker');fflush(stdout);\n";
@@ -1075,6 +1092,12 @@ TODO LIST:
        - done
 
 $Log: Octave.pm,v $
+Revision 1.25  2004/04/12 17:11:17  aadler
+added wnohang signalling
+
+Revision 1.24  2004/04/12 16:12:07  aadler
+set SIGnals only when doing a read
+
 Revision 1.23  2003/12/04 19:22:27  aadler
 working errors and warnings
 
