@@ -6,16 +6,26 @@ use ExtUtils::MakeMaker;
 #   Find the octave interpreter
 #
 
-$octave= "octave";
-$octave_validated= 0;
+my $octave= "octave";
+my $octave_validated= 0;
+
+# check if interpreter was specified on cmd line
+foreach (@ARGV) {
+   if (/^OCTAVE=(.+)/) {
+      $octave= $1;
+      $octave_validated= 1;
+      $_= "";
+   }
+}   
+
 while (not $octave_validated) {
    $octave_validated= 1 if `$octave -v` =~ /Octave, version 2/;
 
    if ($octave_validated) {
-      print "Found octave interpreter:[$octave]\n";
+      print "Found GNU Octave interpreter:[$octave]\n";
       print "Enter new path or <RETURN> to accept: ";
    } else {
-      print "Unable to find octave interpreter at:[$octave]\n";
+      print "Unable to find GNU Octave interpreter at:[$octave]\n";
       print "Please enter new path: " ;
 
    }
@@ -37,7 +47,7 @@ while (not $octave_validated) {
 
    open(OCTAVE, ">Octave.pm") or die "Can't open Octave.pm for writing" ;
    foreach my $line (@lines) {
-      $line =~ s/(\$o->{ILSM}->{INTERP} = \")octave/$1$octave/;
+      $line =~ s/(\$o->{ILSM}->{INTERP} = \")octave +-qf/$1$octave -qf/;
       print OCTAVE $line ;
    }
    close(OCTAVE) ;
@@ -47,5 +57,5 @@ WriteMakefile(
     'NAME'         => 'Inline::Octave',
     'VERSION_FROM' => 'Octave.pm',
     'PREREQ_PM'    => { Inline => 0.4 },
-    'clean'        => {FILES => '_Inline_test/'},  
+    'clean'        => {FILES => '_Inline/'},  
 );
