@@ -325,7 +325,7 @@ sub interpret
 sub get_defined_functions
 {
    my $o = shift;
-   my $data= $o->interpret("whos -functions");
+   my $data= $o->interpret("whos('-functions')");
    my @funclist;
    while ( $data =~ /user(-defined|) function +- +- +(\w+)/g )
    {
