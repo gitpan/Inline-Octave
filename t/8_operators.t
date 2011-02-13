@@ -2,7 +2,7 @@ use strict;
 use Math::Complex;
 use Test;
 BEGIN {
-           plan(tests => 119) ;
+           plan(tests => 115) ;
 }
 
 
@@ -72,12 +72,11 @@ my %methods = (
     gamma=>[1.18107044739768, 0, 0],
     gammaln=>[0.166421186069287, 0, 0],
     imag=>[0, 0.5, 0],
-    is_bool=>[0, 0, 0],
-    is_complex=>[0, 1, 0],
-    is_list=>[0, 0, 0],
-    is_matrix=>[1, 1, 0],
-    is_stream=>[0, 0, 0],
-    is_struct=>[0, 0, 0],
+    islogical=>[0, 0, 0],
+    iscomplex=>[0, 1, 0],
+    islist=>[0, 0, 0],
+    ismatrix=>[1, 1, 0],
+    isstruct=>[0, 0, 0],
     iscell=>[0, 0, 0],
     isempty=>[0, 0, 0],
     isfinite=>[1, 1, 0],

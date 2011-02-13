@@ -2,11 +2,11 @@
 #
 # Inline::Octave - 
 #
-# $Id: Octave.pm,v 1.29 2005/03/07 21:45:15 aadler Exp $
+# $Id: Octave.pm 7780 2011-02-13 20:16:12Z adler $
 
 package Inline::Octave;
 
-$VERSION = '0.21';
+$VERSION = '0.31';
 require Inline;
 @ISA = qw(Inline);
 use Carp;
@@ -213,7 +213,7 @@ sub $perl_funname {
    return \$vout[0];
 }
 CODE
-#  print "--$code--\n";
+  #print "--$code--\n";
    eval $code;
    croak "Problem binding $oct_funname to $perl_funname: $@" if $@;
 
@@ -238,7 +238,7 @@ sub start_interpreter
       $pid= open3( $Oin , $Oout, $Oerr, $octave_object->{INTERP} );
       # set our priority lower than the kid, so that we don't read each
       # character. Experimentally, I've found 3 to be optimum on Linux 2.4.21
-      setpriority 0,0, (getpriority 0,0)+3;
+      setpriority 0,0, (getpriority 0,0)+10;
    };
    # ignore errors from setpriority if it's not available
    croak "Can't locate octave interpreter: $@\n" if $@ =~ /Open3/i;
@@ -263,13 +263,15 @@ sub start_interpreter
    # some of this is necessary, some are the defaults
    # but it never hurts to be cautious
    my $startup_code= <<STARTUP_CODE;
-crash_dumps_octave_core=0;
-page_screen_output=0;
-silent_functions=1;
-do_fortran_indexing=1; 
-page_screen_output=0;
-page_output_immediately=1;
-empty_list_elements_ok=1;
+crash_dumps_octave_core(0);
+page_screen_output(0);
+silent_functions(1);
+page_screen_output(0);
+page_output_immediately(1);
+warning( "off", "Octave:fortran-indexing" );
+warning( "off", "Octave:empty-list-elements" ); 
+more off;
+suppress_verbose_help_message(1);
 STARTUP_CODE
 
    $o->interpret( $startup_code ); # check return value?
@@ -355,6 +357,7 @@ sub interpret
           if ($fh eq $Oerr) {
               process_errors();
           } else {
+
               sysread $fh, (my $line), 16386;
               $input.= $line;
               # delay if we're reading nothing, not sure why select doesn't block
@@ -409,8 +412,8 @@ sub process_errors
            $warning.= $message."; " if $message;
        }
    }
-   carp  "$warning (in octave code)" if $warning;
-   croak "$error (in octave code)"   if $error;
+   carp  "Warning: $warning (in octave code)" if $warning;
+   croak "Error: $error (in octave code)"   if $error;
 }
 
 
@@ -448,20 +451,14 @@ sub run_math_code
 sub get_defined_functions
 {
    my $o = shift;
-   my $data= $o->interpret("who('-functions')");
+   my $data= $o->interpret("__dump_symtab_info__('functions')");
    my @funclist;
    $compiled_fns_marker= 0;
    while ( $data =~ /(.+)/g )
    {
-      my $line = $1;
-      if(       $line =~ /^\*\*\* .* compiled functions/ ) {
-         $compiled_fns_marker = 1;
-      } elsif ( $line =~ /^\*\*\* / ) {
-         $compiled_fns_marker = 0 ;
-      } elsif ( $line =~ /^[\w\s]+$/ && $compiled_fns_marker ) {
-         while( $line =~ /(\w+)/g ) { 
-             push @funclist, $1;
-         }
+      my $line= $1;
+      if ( $line =~ /^\s+(.+) \[c\]/ ) {
+        push @funclist, $1;
       }
    }
    return @funclist;
@@ -796,7 +793,7 @@ sub store_size
 {
    my $self = shift;
    my $varname= $self->name;
-   my $code = "disp([size($varname), is_complex($varname), isstr($varname)] )";
+   my $code = "disp([size($varname), iscomplex($varname), ischar($varname)] )";
    my $size=  Inline::Octave::interpret(0, $code );
    croak "Problem constructing Matrix" unless
        $size =~ /^ +(\d+) +(\d+) +([01]) +([01])/;
@@ -1032,9 +1029,9 @@ unless ($Inline::Octave::methods_defined) {
       erf           => 1, erfc          => 1, exp           => 1,
       eye           => 1, finite        => 1, fix           => 1,
       floor         => 1, gamma         => 1, gammaln       => 1,
-      imag          => 1, is_bool       => 1, is_complex    => 1,
-      is_global     => 1, is_list       => 1, is_matrix     => 1,
-      is_stream     => 1, is_struct     => 1, isalnum       => 1,
+      imag          => 1, islogical     => 1, iscomplex     => 1,
+      isglobal      => 1, islist        => 1, ismatrix      => 1,
+                        , isstruct      => 1, isalnum       => 1,
       isalpha       => 1, isascii       => 1, iscell        => 1,
       iscntrl       => 1, isdigit       => 1, isempty       => 1,
       isfinite      => 1, isieee        => 1, isinf         => 1,
@@ -1270,7 +1267,7 @@ I'm planning to get back to that eventually ...
 
   perl 5.005  or newer
   Inline-0.40 or newer
-  octave 2.0  or newer
+  octave 3.2  or newer
 
 =head2 Platforms
 
@@ -1602,7 +1599,8 @@ Andy Adler   adler at site dot uottawa dot ca
 
 =head1 COPYRIGHT
 
-© MMIII, Andy Adler
+(c) 2003-2011, Andy Adler
+with help from Andreas Krause
 
 All Rights Reserved. This module is free software. It may be used,
 redistributed and/or modified under the same terms as Perl itself.
